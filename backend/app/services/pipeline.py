@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 from app.store import store
+from app.services.dedup_groups import dedup_groups
 
 
 def _now_iso() -> str:
@@ -200,6 +201,7 @@ class IngestPipeline:
                     "schema_version": schema_ver.get("版本号") if schema_ver else "v1.0",
                     "parsed_at": _now_iso(),
                     "content_digest": _stable_digest(fields),
+                    "field_positions": self._field_positions(rule),
                 }
                 parsed_entities.append(entity)
                 raw["status"] = "已解析"
@@ -286,6 +288,15 @@ class IngestPipeline:
                 fields[fn] = parts[i].strip() if i < len(parts) else ""
         return fields
 
+    def _field_positions(self, rule: dict[str, Any]) -> dict[str, int]:
+        """记录每个输出字段取自原始正文的第几段，供去重组对照和重放复算。"""
+        raw_field_list = (rule.get("输出字段列表", "") or "").strip()
+        if raw_field_list and "," in raw_field_list:
+            names = [f.strip() for f in raw_field_list.split(",") if f.strip()]
+        else:
+            names = ["time", "level", "message"]
+        return {name: index for index, name in enumerate(names)}
+
     # ---------- 阶段3：去重 ----------
     def run_dedup(
         self,
@@ -313,6 +324,8 @@ class IngestPipeline:
 
         # 执行去重
         seen: dict[str, int] = {}
+        buckets: dict[str, list[int]] = {}
+        duplicate_ids: set[int] = set()
         duplicates = 0
         for rec in parsed:
             if rec.get("status") != "校验通过":
@@ -324,11 +337,15 @@ class IngestPipeline:
                 fields_data = {}
             key_parts = [str(fields_data.get(k, "")) for k in dedup_key_fields]
             key = "||".join(key_parts)
+            if key not in buckets:
+                buckets[key] = []
+            buckets[key].append(rec["id"])
             if key in seen:
                 if retain_strategy == "keep_first":
                     rec["status"] = "校验失败"
                     rec["abnormal"] = True
                     rec["dedup_id"] = str(seen[key])
+                    duplicate_ids.add(rec["id"])
                     duplicates += 1
                 else:
                     # keep_last：把旧记录标记为重复
@@ -337,11 +354,26 @@ class IngestPipeline:
                         old["status"] = "校验失败"
                         old["abnormal"] = True
                         old["dedup_id"] = str(rec["id"])
+                        duplicate_ids.add(old["id"])
                     rec["status"] = "校验通过"
                     rec["dedup_id"] = ""
                     seen[key] = rec["id"]
             else:
                 seen[key] = rec["id"]
+
+        # 固化去重组：同一键下的全部原始日志留档，值班员可在对照视图逐条溯源。
+        field_versions = {
+            field: {"field": field, "key_field": True, "parser_rule": ""}
+            for field in dedup_key_fields
+        }
+        groups = dedup_groups.build_groups(
+            key_fields=dedup_key_fields,
+            retain_strategy=retain_strategy,
+            parser_rule="",
+            field_versions=field_versions,
+        )
+        built = len(groups)
+        dedup_strategies[-1]["group_count"] = built
 
         return {
             "ok": True,
@@ -350,6 +382,7 @@ class IngestPipeline:
             "dedup_key_fields": dedup_key_fields,
             "duplicates_found": duplicates,
             "unique_keys": len(seen),
+            "groups_created": built,
         }
 
     # ---------- 阶段4：校验 ----------
@@ -410,6 +443,9 @@ class IngestPipeline:
         agg_func: str = "count",
     ) -> dict[str, Any]:
         """基于标准化明细刷新聚合视图。"""
+        blocked = dedup_groups.downstream_blocker()
+        if blocked:
+            return {"ok": False, "blocked": True, "message": blocked}
         parsed = store.rows("parsed_entity")
         results: dict[str, dict[str, Any]] = {}
 
@@ -467,6 +503,9 @@ class IngestPipeline:
         filters: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """从聚合视图或标准化明细生成导出数据。"""
+        blocked = dedup_groups.downstream_blocker()
+        if blocked:
+            return {"ok": False, "blocked": True, "message": blocked}
         exports = store.rows("data_export")
         lineages = store.rows("data_lineage")
 
@@ -578,7 +617,10 @@ class IngestPipeline:
         history_batch_range: str,
         new_parser_rule: str,
     ) -> dict[str, Any]:
-        """用新解析规则版本回溯重放历史批次。"""
+        """用新解析规则版本回溯重放历史批次。
+
+        直接的批次重放仍按批次范围执行；若重建了去重组，会返回可打开的组入口。
+        """
         replayers = store.rows("replay_engine")
 
         replay_id = _next_id("replay_engine")
@@ -618,6 +660,16 @@ class IngestPipeline:
             "replay": replay_entry,
             "replayed_count": replay_count,
         }
+
+    def replay_from_group(
+        self,
+        group_id: int,
+        field: str,
+        position: int,
+        new_parser_rule: str | None = None,
+    ) -> dict[str, Any]:
+        """从去重组对照视图发起重放：先算影响范围，再写入待确认的草稿。"""
+        return dedup_groups.start_replay(group_id, field, position, new_parser_rule)
 
     # ---------- Schema 版本演进 ----------
     def evolve_schema(

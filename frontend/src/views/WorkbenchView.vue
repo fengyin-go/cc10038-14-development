@@ -6,6 +6,15 @@
         <p class="page-desc">{{ meta.desc }}</p>
       </div>
       <div class="page-actions">
+        <button
+          v-if="showGroupEntry"
+          class="btn"
+          data-testid="open-dedup-groups"
+          type="button"
+          @click="openDedupGroups()"
+        >
+          打开去重组对照
+        </button>
         <button class="btn primary" data-testid="open-create" type="button" @click="openCreate">
           登记{{ meta.entity }}
         </button>
@@ -51,6 +60,15 @@
           <td>{{ row.status }}</td>
           <td class="row-actions">
             <button
+              v-if="meta.key === 'parsed_entity' && row.dedup_group_id"
+              class="link"
+              type="button"
+              :data-testid="`dedup-group-${row.id}`"
+              @click="openDedupGroups(Number(row.dedup_group_id))"
+            >
+              查看去重组
+            </button>
+            <button
               v-for="action in meta.actions"
               :key="action"
               class="link"
@@ -95,6 +113,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 
 import {
   createEntry,
@@ -106,7 +125,9 @@ import {
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
+const router = useRouter()
 const meta = moduleMeta(props.moduleKey)
+const showGroupEntry = computed(() => ['dedup_engine', 'parsed_entity', 'replay_engine'].includes(meta.key))
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
@@ -129,6 +150,11 @@ const statusSummary = computed(() =>
     count: rows.value.filter((row) => String(row.status) === status).length,
   })),
 )
+
+function openDedupGroups(groupId?: number) {
+  const query = groupId ? `?group=${groupId}` : ''
+  void router.push(`/dedup-groups${query}`)
+}
 
 function resetFilters() {
   filters.value = {}

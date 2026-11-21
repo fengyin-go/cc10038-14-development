@@ -452,3 +452,188 @@ class TestCrossModuleSnapshot:
 
         raw_snap = SERVICES["raw_records"].domain_snapshot()
         assert raw_snap["count"] > 0
+
+class TestDedupGroups:
+    """去重组对照视图与从组发起的回溯重放测试。"""
+
+    def _demo_group(self):
+        from app.services.dedup_groups import dedup_groups
+        group = dedup_groups.ensure_demo_group()["group"]
+        assert group["member_count"] == 2
+        return group
+
+    def test_demo_group_lists_winner_and_eliminated(self):
+        group = self._demo_group()
+        assert group["eliminated_count"] == 1
+        assert group["winner"]["eliminated"] is False
+        eliminated = group["eliminated"][0]
+        assert eliminated["eliminated"] is True
+        assert eliminated["raw_record_id"]
+        assert eliminated["raw_body"]
+        assert group["field_versions"]
+
+    def test_demo_group_is_idempotent(self):
+        from app.services.dedup_groups import dedup_groups
+        first = dedup_groups.ensure_demo_group()["group"]
+        second = dedup_groups.ensure_demo_group()["group"]
+        assert first["id"] == second["id"]
+
+    def test_preview_scope_follows_cross_group_collision(self):
+        from app.services.dedup_groups import dedup_groups
+        group = self._demo_group()
+        preview = dedup_groups.preview_replay(group["id"], "level", 2)
+        assert preview["ok"] is True
+        # 入口组 + 淘汰日志新键与组外已用记录重合而纳入的组。
+        assert preview["affected_group_count"] > 1
+        assert preview["record_count"] == preview["raw_record_count"] == 6
+        lines = sorted(r["line_no"] for r in preview["records"])
+        assert lines == ["1", "2", "3", "4", "5", "6"]
+        assert preview["raw_record_count"] == len({r["raw_record_id"] for r in preview["records"]})
+
+    def test_eliminated_logs_can_get_different_new_keys(self):
+        from app.services.dedup_groups import dedup_groups
+        group = self._demo_group()
+        preview = dedup_groups.preview_replay(group["id"], "level", 2)
+        # 组外已使用日志 #9 的新键与组内淘汰日志 #7 的新键重合。
+        cross = {r["raw_record_id"]: r for r in preview["cross_group_records"]}
+        assert cross
+        rec = {r["raw_record_id"]: r for r in preview["records"]}
+        assert rec["7"]["recomputed_key"] == rec["9"]["recomputed_key"]
+        # 同组两条被淘汰日志得到不同新键。
+        eliminated = [r for r in preview["records"] if not r["was_winner"]]
+        assert len({r["recomputed_key"] for r in eliminated}) > 1
+
+    def test_replay_blocks_downstream_until_confirmed(self, pipeline):
+        from app.services.dedup_groups import dedup_groups
+        group = self._demo_group()
+        started = dedup_groups.start_replay(group["id"], "level", 2)
+        assert started["ok"] is True
+        assert started["task"]["phase"] == "待确认"
+        assert dedup_groups.downstream_blocker()
+        blocked = pipeline.refresh_aggregation("blocked-view", "level", "time")
+        assert blocked["ok"] is False and blocked["blocked"] is True
+        dedup_groups.confirm_replay(started["task"]["id"])
+        assert dedup_groups.downstream_blocker() is None
+        assert pipeline.refresh_aggregation("open-view", "level", "time")["ok"] is True
+
+    def test_interrupt_resume_confirm_switches_winner(self, pipeline):
+        from app.services.dedup_groups import dedup_groups
+        group = self._demo_group()
+        started = dedup_groups.start_replay(group["id"], "level", 2, interrupt_after=2)
+        assert started["interrupted"] is True
+        assert started["task"]["phase"] == "已中断"
+        task_id = started["task"]["id"]
+        # 中断期间旧组判定保持不变，下游仍被阻断。
+        for item in dedup_groups.list_groups(include_pending=False):
+            assert item["active"] is True
+        assert dedup_groups.downstream_blocker()
+
+        resumed = dedup_groups.resume_replay(task_id)
+        assert resumed["ok"] is True
+        assert len(resumed["task"]["draft"]) == 6
+        assert dedup_groups.downstream_blocker()
+
+        confirmed = dedup_groups.confirm_replay(task_id)
+        assert confirmed["ok"] is True
+        corrections = {c["raw_record_id"]: c for c in confirmed["corrections"]}
+        assert len(corrections) == 6
+        assert any(c["affected_verdict"] == "淘汰→胜出" for c in corrections.values())
+        assert any(c["affected_verdict"] == "胜出→淘汰" for c in corrections.values())
+        winners = {
+            m["raw_record_id"]
+            for g in confirmed["winner_groups"]
+            for m in g["members"] if not m["eliminated"]
+        }
+        assert "5" in winners  # 原被淘汰的组内日志在新键下胜出
+        assert "7" in winners  # 新键与组外日志重合、单独成组并胜出
+        assert "6" not in winners  # 原胜出日志在新键下让位
+        assert dedup_groups.downstream_blocker() is None
+
+    def test_confirm_requires_complete_draft(self):
+        from app.services.dedup_groups import dedup_groups
+        group = self._demo_group()
+        started = dedup_groups.start_replay(group["id"], "level", 2, interrupt_after=1)
+        result = dedup_groups.confirm_replay(started["task"]["id"])
+        assert result["ok"] is False
+        assert "草稿未补齐" in result["message"]
+
+    def test_corrections_link_raw_records_and_verdicts(self):
+        from app.services.dedup_groups import dedup_groups
+        group = self._demo_group()
+        started = dedup_groups.start_replay(group["id"], "level", 2)
+        confirmed = dedup_groups.confirm_replay(started["task"]["id"])
+        for correction in confirmed["corrections"]:
+            assert correction["raw_record_id"]
+            assert correction["raw_body"]
+            assert correction["old_verdict"] in ("胜出", "淘汰")
+            assert correction["new_verdict"] in ("胜出", "淘汰", "撤组")
+            assert correction["old_key"] and correction["new_key"]
+
+    def test_pipeline_dedup_creates_groups(self, pipeline):
+        from app.services.dedup_groups import dedup_groups
+        pipeline.register_source("grp-src", "http", "default")
+        pipeline.validate_source("grp-src")
+        batch = pipeline.start_ingest_batch(
+            "grp-src", "2026Q1",
+            [{"body": "t1|INFO|msg1"}, {"body": "t1|INFO|msg1"}, {"body": "t2|WARN|msg2"}],
+        )
+        batch_no = batch["batch"]["批次编号"]
+        pipeline.parse_batch(batch_no)
+        pipeline.validate_entities(batch_no)
+        result = pipeline.run_dedup(["level"], "batch", "keep_first")
+        assert result["groups_created"] > 0
+        groups = dedup_groups.list_groups(batch_no=batch_no)
+        assert groups
+        assert any(g["eliminated_count"] >= 1 for g in groups)
+
+
+class TestRouteOrdering:
+    """流水线固定路径不能被通用资源路由的动态路径抢占。"""
+
+    def _get(self, path: str) -> tuple[int, bytes]:
+        import asyncio
+        from app.main import app
+
+        async def call() -> tuple[int, bytes]:
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "GET",
+                "scheme": "http",
+                "path": path,
+                "raw_path": path.encode(),
+                "query_string": b"",
+                "headers": [(b"host", b"testserver")],
+                "client": ("127.0.0.1", 1234),
+                "server": ("testserver", 80),
+                "root_path": "",
+            }
+            sent: list[dict] = []
+
+            async def receive() -> dict:
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            async def send(message: dict) -> None:
+                sent.append(message)
+
+            await app(scope, receive, send)
+            status = next(m["status"] for m in sent if m["type"] == "http.response.start")
+            body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+            return status, body
+
+        return asyncio.run(call())
+
+    def test_pipeline_paths_registered_before_resource(self):
+        from app.routers import ROUTERS
+        from app.routers import pipeline_router, resource
+        assert ROUTERS[0] is pipeline_router
+        assert ROUTERS[1] is resource
+
+    def test_pipeline_fixed_paths_are_not_shadowed_by_dynamic_route(self):
+        status, body = self._get("/api/pipeline/dedup-groups")
+        assert status == 200
+        assert "items" in json.loads(body)
+        status, body = self._get("/api/pipeline/snapshot")
+        assert status == 200
+        assert "modules" in json.loads(body)

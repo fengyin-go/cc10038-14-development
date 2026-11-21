@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.services.pipeline import pipeline
+from app.services.dedup_groups import dedup_groups
 
 router = APIRouter(prefix="/api/pipeline", tags=["采集流水线"])
 
@@ -58,6 +59,22 @@ class ReplayPayload(BaseModel):
     new_parser_rule: str = Field(..., min_length=1)
 
 
+class ReplayPreviewPayload(BaseModel):
+    field: str = Field(..., min_length=1)
+    position: int = Field(..., ge=0)
+    new_parser_rule: str | None = None
+
+
+class ReplayStartPayload(ReplayPreviewPayload):
+    interrupt_after: int | None = Field(default=None, ge=0)
+
+
+class ReplayResumePayload(BaseModel):
+    pass
+
+
+class DedupDemoPayload(BaseModel):
+    pass
 class SchemaEvolvePayload(BaseModel):
     version: str = Field(..., min_length=1)
     data_source: str = Field(..., min_length=1)
@@ -127,6 +144,84 @@ def pipeline_advance_watermark(payload: WatermarkPayload) -> dict[str, Any]:
 @router.post("/replay/batch")
 def pipeline_replay_batch(payload: ReplayPayload) -> dict[str, Any]:
     return pipeline.replay_batch(payload.history_batch_range, payload.new_parser_rule)
+
+
+# ---------- 去重组对照视图 ----------
+@router.get("/dedup-groups")
+def list_dedup_groups(
+    keyword: str = "",
+    state: str = "",
+    batch_no: str = "",
+    include_pending: bool = True,
+) -> dict[str, Any]:
+    return {
+        "items": dedup_groups.list_groups(
+            keyword=keyword, state=state, batch_no=batch_no, include_pending=include_pending
+        ),
+        "downstream_blocker": dedup_groups.downstream_blocker(),
+    }
+
+
+@router.get("/dedup-groups/{group_id}")
+def get_dedup_group(group_id: int) -> dict[str, Any]:
+    group = dedup_groups.get_group(group_id)
+    if group is None:
+        raise HTTPException(status_code=404, detail=f"去重组 {group_id} 不存在")
+    return group
+
+
+@router.get("/parsed-entity/{entry_id}/dedup-group")
+def get_group_for_entity(entry_id: int) -> dict[str, Any]:
+    group = dedup_groups.group_for_entity(entry_id)
+    if group is None:
+        raise HTTPException(status_code=404, detail=f"标准化记录 {entry_id} 尚未进入去重组")
+    return group
+
+
+@router.post("/dedup-groups/demo")
+def build_demo_group(_: DedupDemoPayload | None = None) -> dict[str, Any]:
+    return dedup_groups.ensure_demo_group()
+
+
+@router.post("/dedup-groups/{group_id}/replay/preview")
+def preview_group_replay(group_id: int, payload: ReplayPreviewPayload) -> dict[str, Any]:
+    return dedup_groups.preview_replay(
+        group_id, payload.field, payload.position, payload.new_parser_rule
+    )
+
+
+@router.post("/dedup-groups/{group_id}/replay")
+def start_group_replay(group_id: int, payload: ReplayStartPayload) -> dict[str, Any]:
+    return dedup_groups.start_replay(
+        group_id, payload.field, payload.position,
+        payload.new_parser_rule, payload.interrupt_after,
+    )
+
+
+@router.get("/replays")
+def list_replays() -> dict[str, Any]:
+    return {
+        "items": dedup_groups.list_replays(),
+        "downstream_blocker": dedup_groups.downstream_blocker(),
+    }
+
+
+@router.get("/replays/{task_id}")
+def get_replay(task_id: int) -> dict[str, Any]:
+    task = dedup_groups.get_replay(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"重放任务 {task_id} 不存在")
+    return task
+
+
+@router.post("/replays/{task_id}/resume")
+def resume_replay(task_id: int, _: ReplayResumePayload | None = None) -> dict[str, Any]:
+    return dedup_groups.resume_replay(task_id)
+
+
+@router.post("/replays/{task_id}/confirm")
+def confirm_replay(task_id: int) -> dict[str, Any]:
+    return dedup_groups.confirm_replay(task_id)
 
 
 @router.post("/schema/evolve")
